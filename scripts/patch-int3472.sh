@@ -9,36 +9,30 @@ KDIR="/lib/modules/$(uname -r)/build"
 MOD_DIR="/lib/modules/$(uname -r)/kernel/drivers/platform/x86/intel/int3472"
 MEDIA_MOD_DIR="/lib/modules/$(uname -r)/kernel/drivers/media/pci/intel"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ORIG_DISCRETE="${SCRIPT_DIR}/discrete_original.c"
-ORIG_QUIRKS="${SCRIPT_DIR}/discrete_quirks_original.c"
-ORIG_IPU_BRIDGE="${SCRIPT_DIR}/ipu-bridge.original.c"
 
 MOK_KEY=/var/lib/dkms/mok.key
 MOK_PUB=/var/lib/dkms/mok.pub
 
 restore_sources() {
-    if [ -e "${ORIG_DISCRETE}" ]; then
-        echo "Restoring discrete.c from repository baseline"
-        cp "${ORIG_DISCRETE}" "${INT3472_DIR}/discrete.c"
-    elif [ -e "${INT3472_DIR}/discrete.c.backup" ]; then
+    if [ -e "${INT3472_DIR}/discrete.c.backup" ]; then
         echo "Restoring discrete.c from backup"
         cp "${INT3472_DIR}/discrete.c.backup" "${INT3472_DIR}/discrete.c"
+    else
+        echo "No discrete.c backup found; leaving current file in place"
     fi
 
-    if [ -e "${ORIG_QUIRKS}" ]; then
-        echo "Restoring discrete_quirks.c from repository baseline"
-        cp "${ORIG_QUIRKS}" "${INT3472_DIR}/discrete_quirks.c"
-    elif [ -e "${INT3472_DIR}/discrete_quirks.c.backup" ]; then
+    if [ -e "${INT3472_DIR}/discrete_quirks.c.backup" ]; then
         echo "Restoring discrete_quirks.c from backup"
         cp "${INT3472_DIR}/discrete_quirks.c.backup" "${INT3472_DIR}/discrete_quirks.c"
+    else
+        echo "No discrete_quirks.c backup found; leaving current file in place"
     fi
 
-    if [ -e "${ORIG_IPU_BRIDGE}" ]; then
-        echo "Restoring ipu-bridge.c from repository baseline"
-        cp "${ORIG_IPU_BRIDGE}" "${MEDIA_INTEL_DIR}/ipu-bridge.c"
-    elif [ -e "${MEDIA_INTEL_DIR}/ipu-bridge.c.backup" ]; then
+    if [ -e "${MEDIA_INTEL_DIR}/ipu-bridge.c.backup" ]; then
         echo "Restoring ipu-bridge.c from backup"
         cp "${MEDIA_INTEL_DIR}/ipu-bridge.c.backup" "${MEDIA_INTEL_DIR}/ipu-bridge.c"
+    else
+        echo "No ipu-bridge.c backup found; leaving current file in place"
     fi
 }
 

@@ -31,6 +31,12 @@ Options:
 EOF
 }
 
+git_repo() {
+  local dir="$1"
+  shift
+  git -c safe.directory="$dir" -C "$dir" "$@"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --workdir)
@@ -86,11 +92,25 @@ clone_or_fetch() {
   local dir="$2"
   local ref="$3"
   if [[ -d "${dir}/.git" ]]; then
-    git -C "$dir" fetch --depth=1 origin "$ref"
+    if git_repo "$dir" rev-parse --verify --quiet "${ref}^{commit}" >/dev/null; then
+      return 0
+    fi
+    git_repo "$dir" fetch --depth=1 origin "$ref"
   else
     rm -rf "$dir"
     git clone --depth=1 --branch "$ref" "$repo_url" "$dir"
   fi
+}
+
+apply_patch_series() {
+  local dir="$1"
+  shift
+  local patch
+
+  for patch in "$@"; do
+    [[ -e "$patch" ]] || continue
+    patch -d "$dir" --forward --silent -p1 < "$patch"
+  done
 }
 
 if [[ "$SKIP_APT" -eq 0 ]]; then
@@ -120,21 +140,33 @@ if [[ "$SKIP_APT" -eq 0 ]]; then
 fi
 
 if [[ -d "${IPU6_DIR}/.git" ]]; then
-  git -C "$IPU6_DIR" fetch --depth=1 origin "$IPU6_BASE_COMMIT"
+  if git_repo "$IPU6_DIR" rev-parse --verify --quiet "${IPU6_BASE_COMMIT}^{commit}" >/dev/null; then
+    git_repo "$IPU6_DIR" checkout -B export-build "$IPU6_BASE_COMMIT"
+  else
+    git_repo "$IPU6_DIR" checkout -B export-build HEAD
+  fi
 else
   git clone --depth=1 "$IPU6_REPO_URL" "$IPU6_DIR"
-  git -C "$IPU6_DIR" fetch --depth=1 origin "$IPU6_BASE_COMMIT"
+  git_repo "$IPU6_DIR" checkout -B export-build "$IPU6_BASE_COMMIT"
 fi
-git -C "$IPU6_DIR" checkout -B export-build "$IPU6_BASE_COMMIT"
 
 for patch in "$SCRIPT_DIR"/patches/ipu6-drivers/*.patch; do
   [[ -e "$patch" ]] || continue
-  git -C "$IPU6_DIR" apply "$patch"
+  git_repo "$IPU6_DIR" apply "$patch"
 done
 
 cp "$SCRIPT_DIR"/scripts/*.py "$IPU6_DIR"/
 cp "$SCRIPT_DIR"/scripts/*.sh "$IPU6_DIR"/
 cp "$SCRIPT_DIR"/scripts/services/*.service "$IPU6_DIR"/
+for artifact in \
+  int3472-gc5035-skylake.diff \
+  int3472-gc5035-skylake-quirks.diff \
+  ipu-bridge-gc5035.diff
+do
+  if [[ -e "$SCRIPT_DIR/scripts/$artifact" ]]; then
+    cp "$SCRIPT_DIR/scripts/$artifact" "$IPU6_DIR"/
+  fi
+done
 mkdir -p "$IPU6_DIR/ipa-config/simple"
 cp "$SCRIPT_DIR"/scripts/tuning/*.yaml "$IPU6_DIR/ipa-config/simple"/
 
@@ -143,20 +175,29 @@ sudo dkms add "$IPU6_DIR"
 sudo dkms autoinstall -m ipu6-drivers -v 0.0.0
 sudo depmod -a
 
-clone_or_fetch "$LIBCAMERA_REPO_URL" "$LIBCAMERA_DIR" "$LIBCAMERA_TAG"
-git -C "$LIBCAMERA_DIR" checkout -B export-build "$LIBCAMERA_TAG"
-for patch in "$SCRIPT_DIR"/patches/libcamera/*.patch; do
-  [[ -e "$patch" ]] || continue
-  git -C "$LIBCAMERA_DIR" apply "$patch"
-done
+if [[ -d "$LIBCAMERA_DIR/.git" ]]; then
+  git_repo "$LIBCAMERA_DIR" checkout -B export-build "$LIBCAMERA_TAG"
+  for patch in "$SCRIPT_DIR"/patches/libcamera/*.patch; do
+    [[ -e "$patch" ]] || continue
+    git_repo "$LIBCAMERA_DIR" apply "$patch"
+  done
+elif [[ -d "$LIBCAMERA_DIR" ]]; then
+  apply_patch_series "$LIBCAMERA_DIR" "$SCRIPT_DIR"/patches/libcamera/*.patch
+else
+  clone_or_fetch "$LIBCAMERA_REPO_URL" "$LIBCAMERA_DIR" "$LIBCAMERA_TAG"
+  git_repo "$LIBCAMERA_DIR" checkout -B export-build "$LIBCAMERA_TAG"
+  for patch in "$SCRIPT_DIR"/patches/libcamera/*.patch; do
+    [[ -e "$patch" ]] || continue
+    git_repo "$LIBCAMERA_DIR" apply "$patch"
+  done
+fi
 meson setup "$LIBCAMERA_DIR/build" "$LIBCAMERA_DIR" --buildtype=release --prefix=/usr/local
 ninja -C "$LIBCAMERA_DIR/build"
 sudo ninja -C "$LIBCAMERA_DIR/build" install
 sudo ldconfig
 
 if [[ -d "${V4L2LOOPBACK_DIR}/.git" ]]; then
-  git -C "$V4L2LOOPBACK_DIR" fetch --depth=1 origin master
-  git -C "$V4L2LOOPBACK_DIR" checkout -B export-build FETCH_HEAD
+  git_repo "$V4L2LOOPBACK_DIR" checkout -B export-build HEAD
 else
   git clone --depth=1 "$V4L2LOOPBACK_REPO_URL" "$V4L2LOOPBACK_DIR"
 fi
