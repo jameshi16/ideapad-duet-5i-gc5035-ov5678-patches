@@ -1,0 +1,15 @@
+10a11,14
+> static const struct int3472_discrete_quirks lenovo_ideapad_duet_5_quirks = {
+> 	.avdd_second_sensor = "i2c-GCTI5035:00",
+> };
+> 
+19a24,32
+> 	{
+> 		/* Lenovo IdeaPad Duet 5 12IAU7 */
+> 		.matches = {
+> 			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+> 			DMI_MATCH(DMI_PRODUCT_NAME, "82TQ"),
+> 			DMI_MATCH(DMI_PRODUCT_VERSION, "IdeaPad Duet 5 12IAU7"),
+> 		},
+> 		.driver_data = (void *)&lenovo_ideapad_duet_5_quirks,
+> 	},

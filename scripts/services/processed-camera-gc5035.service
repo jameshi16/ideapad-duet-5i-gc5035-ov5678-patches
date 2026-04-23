@@ -1,0 +1,22 @@
+[Unit]
+Description=Processed virtual camera pipeline (GC5035)
+After=processed-camera-loopback.service
+Requires=processed-camera-loopback.service
+Conflicts=processed-camera-ov5678.service processed-camera-gc5035-fullres.service processed-camera-ov5678-fullres.service
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/agent/ipu6-drivers
+ExecStartPre=/usr/bin/bash -lc '/home/agent/ipu6-drivers/configure-camera-link.sh gc5035'
+ExecStartPre=/usr/bin/bash -lc '/home/agent/ipu6-drivers/camera-controls.sh --sensor gc5035 --preset pipeline'
+ExecStart=/usr/bin/python3 /home/agent/ipu6-drivers/camera_pipeline.py --sensor gc5035 --input /dev/video8 --loopback /dev/video42 --in-width 2592 --in-height 1944 --downscale 2 --out-width 1280 --out-height 960 --out-fps 15 --capture-fps 15
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

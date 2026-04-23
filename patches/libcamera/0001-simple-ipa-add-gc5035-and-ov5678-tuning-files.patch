@@ -1,0 +1,60 @@
+diff --git a/src/ipa/simple/data/gc5035.yaml b/src/ipa/simple/data/gc5035.yaml
+new file mode 100644
+index 0000000..acb3e9f
+--- /dev/null
++++ b/src/ipa/simple/data/gc5035.yaml
+@@ -0,0 +1,18 @@
++# SPDX-License-Identifier: CC0-1.0
++# libcamera "simple" (SoftISP) tuning for GalaxyCore GC5035 on Intel IPU6.
++# Only the sensor-specific black pedestal is pinned; AWB/Lut/AGC use the
++# SoftISP auto-tuning defaults.
++%YAML 1.1
++---
++version: 1
++algorithms:
++  - BlackLevel:
++      # GC5035 analog black pedestal is 64 at 10-bit (0x40). libcamera's
++      # simple IPA reads blackLevel as a 16-bit scaled int16_t and shifts
++      # >>8 to get the 8-bit pedestal used by the SoftISP:
++      #   64 * 64 == 4096 == 16 << 8.
++      blackLevel: 4096
++  - Awb:
++  - Lut:
++  - Agc:
++...
+diff --git a/src/ipa/simple/data/meson.build b/src/ipa/simple/data/meson.build
+index 92795ee..e474cb3 100644
+--- a/src/ipa/simple/data/meson.build
++++ b/src/ipa/simple/data/meson.build
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: CC0-1.0
+ 
+ conf_files = files([
++    'gc5035.yaml',
++    'ov5678.yaml',
+     'uncalibrated.yaml',
+ ])
+ 
+diff --git a/src/ipa/simple/data/ov5678.yaml b/src/ipa/simple/data/ov5678.yaml
+new file mode 100644
+index 0000000..8f26a8e
+--- /dev/null
++++ b/src/ipa/simple/data/ov5678.yaml
+@@ -0,0 +1,17 @@
++# SPDX-License-Identifier: CC0-1.0
++# libcamera "simple" (SoftISP) tuning for Omnivision OV5678 (RGB-IR).
++# Keep this minimal and pin the black pedestal so SoftISP starts from a
++# sensible baseline; AWB/Lut/AGC remain auto/default.
++%YAML 1.1
++---
++version: 1
++algorithms:
++  - BlackLevel:
++      # OV5678 driver family uses 0x40 at 10-bit as analog black level.
++      # simple IPA uses 16-bit-scaled value (>> 8 internally), so:
++      #   64 * 64 == 4096
++      blackLevel: 4096
++  - Awb:
++  - Lut:
++  - Agc:
++...

@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: CC0-1.0
+# libcamera "simple" (SoftISP) tuning for GalaxyCore GC5035 on Intel IPU6.
+# Only the sensor-specific black pedestal is pinned; AWB/Lut/AGC use the
+# SoftISP auto-tuning defaults.
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - BlackLevel:
+      # GC5035 analog black pedestal is 64 at 10-bit (0x40). libcamera's
+      # simple IPA reads blackLevel as a 16-bit scaled int16_t and shifts
+      # >>8 to get the 8-bit pedestal used by the SoftISP:
+      #   64 * 64 == 4096 == 16 << 8.
+      blackLevel: 4096
+  - Awb:
+  - Lut:
+  - Agc:
+...

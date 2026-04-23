@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: CC0-1.0
+# libcamera "simple" (SoftISP) tuning for Omnivision OV5678 (RGB-IR).
+# Keep this minimal and pin the black pedestal so SoftISP starts from a
+# sensible baseline; AWB/Lut/AGC remain auto/default.
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - BlackLevel:
+      # OV5678 driver family uses 0x40 at 10-bit as analog black level.
+      # simple IPA uses 16-bit-scaled value (>> 8 internally), so:
+      #   64 * 64 == 4096
+      blackLevel: 4096
+  - Awb:
+  - Lut:
+  - Agc:
+...
