@@ -15,6 +15,7 @@ VBLANK=""
 TEST_PATTERN=""
 PRESET=""
 SHOW=0
+PRESET_HANDLED=0
 
 usage() {
   cat <<'EOF'
@@ -93,6 +94,31 @@ if [[ -z "$SENSOR" ]]; then
   exit 2
 fi
 
+apply_ov5678_auto() {
+  local bus="/dev/i2c-3"
+
+  if [[ ! -e "$bus" ]]; then
+    sudo modprobe i2c-dev
+  fi
+
+  echo "Applying to ov5678: auto AEC/AGC (0x3503=0x00)"
+  sudo python3 - <<'PY'
+import fcntl
+import os
+
+I2C_SLAVE_FORCE = 0x0706
+OV5678_ADDR = 0x36
+bus = "/dev/i2c-3"
+
+fd = os.open(bus, os.O_RDWR)
+try:
+    fcntl.ioctl(fd, I2C_SLAVE_FORCE, OV5678_ADDR)
+    os.write(fd, bytes([0x35, 0x03, 0x00]))
+finally:
+    os.close(fd)
+PY
+}
+
 apply_preset() {
   local sensor="$1"
   local preset="$2"
@@ -120,6 +146,8 @@ apply_preset() {
       DIGITAL_GAIN=${DIGITAL_GAIN:-1023}
       ;;
     ov5678:auto)
+      apply_ov5678_auto
+      PRESET_HANDLED=1
       ;;
     ov5678:daylight)
       EXPOSURE=${EXPOSURE:-350}
@@ -137,8 +165,8 @@ apply_preset() {
       DIGITAL_GAIN=${DIGITAL_GAIN:-1024}
       ;;
     ov5678:pipeline)
-      EXPOSURE=${EXPOSURE:-2048}
-      ANALOG_GAIN=${ANALOG_GAIN:-256}
+      EXPOSURE=${EXPOSURE:-512}
+      ANALOG_GAIN=${ANALOG_GAIN:-1024}
       DIGITAL_GAIN=${DIGITAL_GAIN:-1024}
       ;;
     *)
@@ -172,6 +200,9 @@ apply_controls() {
   [[ -n "$TEST_PATTERN" ]] && args+=("test_pattern=$TEST_PATTERN")
 
   if [[ ${#args[@]} -eq 0 ]]; then
+    if [[ "$PRESET_HANDLED" -eq 1 ]]; then
+      return
+    fi
     echo "No controls requested for $label; use --show or set options." >&2
     return
   fi
@@ -202,6 +233,7 @@ esac
 for t in "${targets[@]}"; do
   sensor_name=${t%%:*}
   dev=${t#*:}
+  PRESET_HANDLED=0
   [[ -n "$PRESET" ]] && apply_preset "$sensor_name" "$PRESET"
   apply_controls "$dev" "$sensor_name"
 done

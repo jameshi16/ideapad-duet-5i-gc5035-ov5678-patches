@@ -163,8 +163,8 @@ for artifact in \
   int3472-gc5035-skylake-quirks.diff \
   ipu-bridge-gc5035.diff
 do
-  if [[ -e "$SCRIPT_DIR/scripts/$artifact" ]]; then
-    cp "$SCRIPT_DIR/scripts/$artifact" "$IPU6_DIR"/
+  if [[ -e "$SCRIPT_DIR/patches/host-kernel/$artifact" ]]; then
+    cp "$SCRIPT_DIR/patches/host-kernel/$artifact" "$IPU6_DIR"/
   fi
 done
 mkdir -p "$IPU6_DIR/ipa-config/simple"
@@ -218,10 +218,10 @@ Install service units:
   sudo cp "$IPU6_DIR"/processed-camera-*.service /etc/systemd/system/
   sudo systemctl daemon-reload
   sudo systemctl enable processed-camera-loopback.service
-  sudo systemctl enable processed-camera-gc5035.service
-  sudo systemctl enable processed-camera-ov5678.service
+  sudo systemctl disable processed-camera-gc5035.service processed-camera-ov5678.service
+  sudo systemctl disable processed-camera-gc5035-fullres.service processed-camera-ov5678-fullres.service
 
-Select camera:
+Select exactly one camera before opening Firefox:
   sudo "$IPU6_DIR/select-camera.sh" gc5035
   sudo "$IPU6_DIR/select-camera.sh" ov5678
 EOF

@@ -15,6 +15,8 @@ import mmap
 import os
 import select
 import signal
+import struct
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -60,6 +62,7 @@ class SensorProfile:
     default_ccm_profile: str = "none"
     default_awb_mode: str = "grayworld"
     default_awb_strength: float = 0.75
+    default_awb_ema: float = 0.20
     default_color_saturation: float | None = None
     default_rgbir_pattern: str = "openrgbir"
     default_legacy_rgbir_pattern: str = "openrgbir"
@@ -101,10 +104,11 @@ SENSOR_PROFILES = {
         default_ccm_profile="none",
         default_awb_mode="grayworld",
         default_awb_strength=0.85,
+        default_awb_ema=0.20,
         default_color_saturation=None,
         default_rgbir_pattern="windows-cjfl515",
         default_legacy_rgbir_pattern="windows-cjfl515",
-        default_temporal_alpha=0.18,
+        default_temporal_alpha=0.0,
         default_pink_fix_strength=0.0,
     ),
 }
@@ -219,6 +223,44 @@ VIDIOC_DQBUF = _IOWR("V", 17, v4l2_buffer)
 VIDIOC_STREAMON = _IOW("V", 18, ctypes.c_int)
 VIDIOC_STREAMOFF = _IOW("V", 19, ctypes.c_int)
 
+_I2C_SLAVE_FORCE = 0x0706
+_OV5678_I2C_BUS = 3
+_OV5678_I2C_ADDR = 0x36
+
+
+def _ov5678_freeze_aec(settle_seconds: float = 1.5) -> None:
+    """Disable OV5678 AEC/AGC after streaming starts to stop exposure hunting.
+
+    Waits settle_seconds for AEC to converge on a scene-appropriate exposure,
+    then writes 0x3503=0x04 (manual exposure + auto gain) via /dev/i2c-3.
+    Without this, 0x3503=0x00 (Patch 3) keeps AEC running indefinitely, causing
+    periodic brightness oscillations that are visible as pulsing.
+    """
+    bus_dev = f"/dev/i2c-{_OV5678_I2C_BUS}"
+    if not os.path.exists(bus_dev):
+        try:
+            subprocess.run(["modprobe", "i2c-dev"], check=True, capture_output=True)
+        except Exception as exc:
+            LOG.warning("OV5678: modprobe i2c-dev failed: %s", exc)
+
+    if settle_seconds > 0:
+        LOG.info("OV5678: waiting %.1fs for AEC to settle before freezing", settle_seconds)
+        time.sleep(settle_seconds)
+
+    try:
+        fd = os.open(bus_dev, os.O_RDWR)
+        try:
+            fcntl.ioctl(fd, _I2C_SLAVE_FORCE, _OV5678_I2C_ADDR)
+            # 16-bit register address 0x3503, value 0x04: manual AEC (bit[2]),
+            # auto AGC (bit[3]=0). This is the pre-Patch-3 manual-exposure value.
+            os.write(fd, struct.pack("BBB", 0x35, 0x03, 0x04))
+        finally:
+            os.close(fd)
+        LOG.info("OV5678: AEC frozen (0x3503=0x04, i2c-%d@0x%02x)",
+                 _OV5678_I2C_BUS, _OV5678_I2C_ADDR)
+    except Exception as exc:
+        LOG.warning("OV5678: AEC freeze via i2c failed: %s", exc)
+
 
 class RawCaptureStream:
     """Minimal mmap-based V4L2 capture for the IPU6 raw video nodes."""
@@ -272,6 +314,10 @@ class RawCaptureStream:
         if not ready:
             return None
 
+        # Drain all queued buffers and return only the most-recent frame to
+        # avoid falling progressively behind when processing is slower than the
+        # sensor rate.
+        last_data = None
         while True:
             buf = v4l2_buffer()
             buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE
@@ -279,12 +325,10 @@ class RawCaptureStream:
             try:
                 fcntl.ioctl(self.fd, VIDIOC_DQBUF, buf)
             except BlockingIOError:
-                return None
-
-            try:
-                return bytes(self.maps[buf.index][: buf.bytesused])
-            finally:
-                fcntl.ioctl(self.fd, VIDIOC_QBUF, buf)
+                break
+            last_data = bytes(self.maps[buf.index][: buf.bytesused])
+            fcntl.ioctl(self.fd, VIDIOC_QBUF, buf)
+        return last_data
 
     def close(self):
         if self.fd is None:
@@ -321,7 +365,7 @@ def build_output_pipeline(device, width, height, out_fps):
         " ! ".join(
             [
                 (
-                    "appsrc name=rgbsrc is-live=true block=false format=time do-timestamp=true "
+                    "appsrc name=rgbsrc is-live=true block=false format=time do-timestamp=false "
                     f"caps=video/x-raw,format=BGR,width={width},height={height},framerate={out_fps}/1"
                 ),
                 "queue max-size-buffers=2 leaky=downstream",
@@ -675,6 +719,7 @@ def process_frame(raw16, profile, bgr_gains, ir_cut, ir_clip, args, norm_state):
             ccm_profile=args.ccm_profile,
             awb_mode=args.awb_mode,
             awb_strength=args.awb_strength,
+            awb_ema=args.awb_ema,
             color_saturation=args.color_saturation,
             rgbir_pattern=args.rgbir_pattern,
             pattern_y_offset=args.rgbir_pattern_y_offset,
@@ -815,6 +860,10 @@ def run_pipeline(args):
         out_pipe.set_state(Gst.State.NULL)
         raise
 
+    do_freeze_aec = args.freeze_aec if args.freeze_aec is not None else (args.sensor == "ov5678")
+    if do_freeze_aec:
+        _ov5678_freeze_aec(settle_seconds=args.freeze_aec_delay)
+
     LOG.info(
         "Running: sensor=%s input=%s loopback=%s in=%dx%d out=%dx%d out-fps=%d",
         args.sensor,
@@ -843,10 +892,14 @@ def run_pipeline(args):
     frame_count = 0
     dropped = 0
     dark_run = 0
+    consecutive_timeouts = 0
     start_ts = time.time()
+    pipeline_start_ns = time.monotonic_ns()
     frame_duration_ns = int(1_000_000_000 / max(args.out_fps, 1))
     norm_state = {"low": None, "high": None}
     temporal_state = {"frame": None, "luma": None}
+    raw_pair_buf = None  # holds first raw16 of an in-progress pair
+    parity_means = [None, None]  # running EMA of processed luma per even/odd parity bucket
 
     try:
         while not STOP:
@@ -855,7 +908,14 @@ def run_pipeline(args):
 
             raw_bytes = capture.read_frame()
             if raw_bytes is None:
+                consecutive_timeouts += 1
+                if consecutive_timeouts >= args.max_consecutive_timeouts:
+                    raise RuntimeError(
+                        f"capture stream timed out after {consecutive_timeouts} consecutive misses"
+                        " — forcing restart"
+                    )
                 continue
+            consecutive_timeouts = 0
 
             try:
                 raw16 = decode_raw_frame(raw_bytes, args.in_width, args.in_height)
@@ -864,7 +924,18 @@ def run_pipeline(args):
                 LOG.warning("discarding malformed raw frame: %s", exc)
                 continue
 
-            if args.downscale == 2:
+            if args.pair_average:
+                if raw_pair_buf is None:
+                    raw_pair_buf = raw16
+                    continue  # wait for the second frame of this pair
+                raw16 = (
+                    (raw_pair_buf.astype(np.uint32) + raw16.astype(np.uint32)) >> 1
+                ).astype(np.uint16)
+                raw_pair_buf = None
+
+            if args.downscale >= 2:
+                raw16 = downscale_raw2x(raw16, cfa_period=profile.cfa_period)
+            if args.downscale >= 4:
                 raw16 = downscale_raw2x(raw16, cfa_period=profile.cfa_period)
 
             bgr, norm_low, norm_high = process_frame(
@@ -883,6 +954,26 @@ def run_pipeline(args):
                     (args.out_width, args.out_height),
                     interpolation=cv2.INTER_AREA,
                 )
+
+            if args.parity_correct:
+                cur_luma = float(estimate_luma_mean_u8(bgr))
+                alpha = args.parity_ema_alpha
+                if parity_means[0] is None:
+                    parity_means[0] = cur_luma
+                elif parity_means[1] is None:
+                    if abs(cur_luma - parity_means[0]) > 5.0:
+                        parity_means[1] = cur_luma
+                    else:
+                        parity_means[0] = parity_means[0] * (1.0 - alpha) + cur_luma * alpha
+                else:
+                    p = 0 if abs(cur_luma - parity_means[0]) <= abs(cur_luma - parity_means[1]) else 1
+                    parity_means[p] = parity_means[p] * (1.0 - alpha) + cur_luma * alpha
+                    sep = abs(parity_means[0] - parity_means[1])
+                    if sep > 5.0 and parity_means[p] > 1.0:
+                        target = (parity_means[0] + parity_means[1]) * 0.5
+                        gain = float(np.clip(target / parity_means[p], 0.5, 2.0))
+                        bgr = np.clip(bgr.astype(np.float32) * gain, 0, 255).astype(np.uint8)
+
             bgr = apply_temporal_denoise(
                 bgr,
                 state=temporal_state,
@@ -890,7 +981,7 @@ def run_pipeline(args):
                 reset_threshold=args.temporal_reset_threshold,
             )
 
-            pts_ns = frame_count * frame_duration_ns
+            pts_ns = time.monotonic_ns() - pipeline_start_ns
             gst_out = make_buffer_from_frame(bgr, pts_ns, frame_duration_ns)
             flow = appsrc.emit("push-buffer", gst_out)
             if flow != Gst.FlowReturn.OK:
@@ -969,7 +1060,7 @@ def parse_args():
     p.add_argument(
         "--downscale",
         type=int,
-        choices=(1, 2),
+        choices=(1, 2, 4),
         default=1,
         help="Raw-domain downscale factor before demosaic",
     )
@@ -1020,6 +1111,12 @@ def parse_args():
         help="White balance mode for direct OV5678 RGB-IR mode",
     )
     p.add_argument("--awb-strength", type=float, default=None)
+    p.add_argument(
+        "--awb-ema",
+        type=float,
+        default=None,
+        help="EMA alpha for grayworld AWB gain smoothing; 0=per-frame, default sensor-specific",
+    )
     p.add_argument(
         "--color-saturation",
         type=float,
@@ -1085,6 +1182,27 @@ def parse_args():
     p.add_argument("--dark-luma-threshold", type=float, default=22.0)
     p.add_argument("--dark-frame-window", type=int, default=45)
     p.add_argument(
+        "--pair-average",
+        action="store_true",
+        default=False,
+        help="Average consecutive raw frame pairs before demosaic to cancel even/odd alternation (OV5678 pulsing fix).",
+    )
+    p.add_argument(
+        "--parity-correct",
+        action="store_true",
+        default=False,
+        help=(
+            "Normalize even/odd raw frame levels via per-parity EMA gain correction. "
+            "Suppresses OV5678 alternation without frame-pair averaging, keeping full framerate."
+        ),
+    )
+    p.add_argument(
+        "--parity-ema-alpha",
+        type=float,
+        default=0.05,
+        help="EMA decay for parity mean tracking (0.05 = ~20-frame memory). Lower = slower adaptation.",
+    )
+    p.add_argument(
         "--temporal-alpha",
         type=float,
         default=None,
@@ -1110,8 +1228,26 @@ def parse_args():
     p.add_argument("--pink-fix-hue-shift", type=float, default=62.0)
     p.add_argument("--pink-fix-sat-scale", type=float, default=1.22)
 
+    p.add_argument(
+        "--freeze-aec",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Freeze OV5678 AEC/AGC via i2c after streaming starts (default: on for ov5678).",
+    )
+    p.add_argument(
+        "--freeze-aec-delay",
+        type=float,
+        default=1.5,
+        help="Seconds to let AEC settle before freezing it (default 1.5).",
+    )
     p.add_argument("--pull-timeout-ms", type=int, default=2000)
     p.add_argument("--capture-buffers", type=int, default=4)
+    p.add_argument(
+        "--max-consecutive-timeouts",
+        type=int,
+        default=10,
+        help="Raise a fatal error after this many consecutive read_frame() timeouts to trigger systemd restart",
+    )
     p.add_argument("--log-every", type=int, default=60)
     p.add_argument("--max-frames", type=int, default=0, help="0 means run forever")
     p.add_argument("--verbose", action="store_true")
@@ -1135,6 +1271,8 @@ def main():
         args.awb_mode = profile.default_awb_mode
     if args.awb_strength is None:
         args.awb_strength = profile.default_awb_strength
+    if args.awb_ema is None:
+        args.awb_ema = profile.default_awb_ema
     if args.color_saturation is None:
         args.color_saturation = profile.default_color_saturation
     if args.rgbir_pattern is None:

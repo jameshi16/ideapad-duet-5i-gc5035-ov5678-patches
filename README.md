@@ -40,17 +40,17 @@ is copied into the ipu6 tree by `apply-and-build.sh` and can be invoked automati
 
 ## Services and camera switching
 
-After installation, copy service units and enable:
+After installation, copy service units and enable only loopback at boot:
 
 ```bash
 sudo cp processed-camera-*.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable processed-camera-loopback.service
-sudo systemctl enable processed-camera-gc5035.service
-sudo systemctl enable processed-camera-ov5678.service
+sudo systemctl disable processed-camera-gc5035.service processed-camera-ov5678.service
+sudo systemctl disable processed-camera-gc5035-fullres.service processed-camera-ov5678-fullres.service
 ```
 
-Switch active sensor pipeline:
+Before opening browser camera access (Firefox), select exactly one active sensor:
 
 ```bash
 sudo ./select-camera.sh gc5035

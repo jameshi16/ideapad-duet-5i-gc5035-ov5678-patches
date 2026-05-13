@@ -122,6 +122,7 @@ class OV5678RgbirSettings:
     ccm_profile: str = "ov5678-indoor"
     awb_mode: str = "grayworld"
     awb_strength: float = 0.85
+    awb_ema: float = 0.20
     color_saturation: float | None = None
     rgbir_pattern: str = "openrgbir"
     pattern_y_offset: int = 0
@@ -145,7 +146,55 @@ def _make_mask(shape: tuple[int, int], coords: tuple[tuple[int, int], ...]) -> n
     return mask
 
 
-def _sparse_interpolate(values: np.ndarray, mask: np.ndarray, sigma: float) -> np.ndarray:
+_INTERP_CACHE: dict = {}
+
+_IR_SIGMA = 1.5
+
+
+def _get_channel_cache(shape: tuple[int, int], settings: "OV5678RgbirSettings") -> dict:
+    """Return per-channel (mask, maskf, denom) cached by frame shape + pattern params.
+
+    The denominator GaussianBlur of the static mask is constant across frames,
+    so we compute it once and reuse it to cut 4 of 8 blur calls per frame.
+    """
+    key = (
+        shape,
+        settings.rgbir_pattern,
+        settings.pattern_y_offset,
+        settings.pattern_x_offset,
+        settings.pattern_flip_h,
+        settings.pattern_flip_v,
+        _IR_SIGMA,
+        settings.interp_sigma,
+    )
+    if key in _INTERP_CACHE:
+        return _INTERP_CACHE[key]
+
+    pattern = resolve_rgbir_pattern(
+        settings.rgbir_pattern,
+        y_offset=settings.pattern_y_offset,
+        x_offset=settings.pattern_x_offset,
+        flip_h=settings.pattern_flip_h,
+        flip_v=settings.pattern_flip_v,
+    )
+    entry: dict = {"pattern": pattern}
+    for channel in ("IR", "R", "G", "B"):
+        sigma = _IR_SIGMA if channel == "IR" else settings.interp_sigma
+        mask = _make_mask(shape, pattern[channel])
+        maskf = mask.astype(np.float32)
+        s = max(float(sigma), 0.1)
+        denom = cv2.GaussianBlur(maskf, (0, 0), sigmaX=s, sigmaY=s, borderType=cv2.BORDER_REFLECT)
+        entry[channel] = (mask, maskf, denom)
+    _INTERP_CACHE[key] = entry
+    return entry
+
+
+def _sparse_interpolate(
+    values: np.ndarray,
+    mask: np.ndarray,
+    sigma: float,
+    denom: np.ndarray | None = None,
+) -> np.ndarray:
     maskf = mask.astype(np.float32)
     sigma = max(float(sigma), 0.1)
     numerator = cv2.GaussianBlur(
@@ -155,14 +204,15 @@ def _sparse_interpolate(values: np.ndarray, mask: np.ndarray, sigma: float) -> n
         sigmaY=sigma,
         borderType=cv2.BORDER_REFLECT,
     )
-    denominator = cv2.GaussianBlur(
-        maskf,
-        (0, 0),
-        sigmaX=sigma,
-        sigmaY=sigma,
-        borderType=cv2.BORDER_REFLECT,
-    )
-    return numerator / np.maximum(denominator, 1e-6)
+    if denom is None:
+        denom = cv2.GaussianBlur(
+            maskf,
+            (0, 0),
+            sigmaX=sigma,
+            sigmaY=sigma,
+            borderType=cv2.BORDER_REFLECT,
+        )
+    return numerator / np.maximum(denom, 1e-6)
 
 
 def _phase_equalize(values: np.ndarray, coords: tuple[tuple[int, int], ...]) -> None:
@@ -207,10 +257,16 @@ def _adaptive_range(rgb: np.ndarray, settings: OV5678RgbirSettings, norm_state: 
     return float(norm_state["rgbir_low"]), float(norm_state["rgbir_high"])
 
 
-def _apply_grayworld_awb(rgb: np.ndarray, strength: float) -> np.ndarray:
+def _apply_grayworld_awb(
+    rgb: np.ndarray,
+    strength: float,
+    awb_state: dict | None = None,
+    awb_ema: float = 0.20,
+) -> np.ndarray:
     gray = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
-    lo = float(np.percentile(gray, 15.0))
-    hi = float(np.percentile(gray, 90.0))
+    gray_sample = gray[::8, ::8]
+    lo = float(np.percentile(gray_sample, 15.0))
+    hi = float(np.percentile(gray_sample, 90.0))
     mask = (gray > lo) & (gray < hi)
     if not np.any(mask):
         return rgb
@@ -220,9 +276,21 @@ def _apply_grayworld_awb(rgb: np.ndarray, strength: float) -> np.ndarray:
         return rgb
 
     target = float(np.median(means))
-    gains = np.clip(target / means, 0.55, 1.85)
+    # Cap raised to 2.50 to allow sufficient B boost under warm (tungsten/halogen) lighting.
+    gains = np.clip(target / means, 0.40, 2.50)
     strength = float(np.clip(strength, 0.0, 1.0))
     gains = 1.0 + (gains - 1.0) * strength
+
+    # Smooth gains across frames to suppress per-frame AWB oscillation caused by
+    # residual sensor CFA parity affecting the midtone pixel distribution.
+    if awb_state is not None:
+        prev = awb_state.get("awb_gains")
+        if prev is None:
+            awb_state["awb_gains"] = gains.copy()
+        else:
+            awb_state["awb_gains"] = prev * (1.0 - awb_ema) + gains * awb_ema
+        gains = awb_state["awb_gains"]
+
     return rgb * gains.reshape(1, 1, 3)
 
 
@@ -263,16 +331,11 @@ def process_ov5678_rgbir(
     raw = raw16.astype(np.float32) - float(settings.black_level)
     np.maximum(raw, 0.0, out=raw)
 
-    pattern = resolve_rgbir_pattern(
-        settings.rgbir_pattern,
-        y_offset=settings.pattern_y_offset,
-        x_offset=settings.pattern_x_offset,
-        flip_h=settings.pattern_flip_h,
-        flip_v=settings.pattern_flip_v,
-    )
+    ch_cache = _get_channel_cache(raw.shape, settings)
+    pattern = ch_cache["pattern"]
 
-    ir_mask = _make_mask(raw.shape, pattern["IR"])
-    ir_full = _sparse_interpolate(raw, ir_mask, sigma=1.5)
+    ir_mask, _ir_maskf, ir_denom = ch_cache["IR"]
+    ir_full = _sparse_interpolate(raw, ir_mask, sigma=_IR_SIGMA, denom=ir_denom)
     ir_cut, _auto_ir = parse_ir_cut(settings.ir_cut)
     if ir_cut > 0.0:
         clip_max = float(np.max(raw)) / max(float(settings.ir_clip), 1e-6)
@@ -285,10 +348,10 @@ def process_ov5678_rgbir(
     planes = []
     for channel in ("R", "G", "B"):
         coords = pattern[channel]
-        mask = _make_mask(work.shape, coords)
+        mask, _maskf, denom = ch_cache[channel]
         if settings.grid_correct:
             _phase_equalize(work, coords)
-        planes.append(_sparse_interpolate(work, mask, sigma=settings.interp_sigma))
+        planes.append(_sparse_interpolate(work, mask, sigma=settings.interp_sigma, denom=denom))
 
     rgb = np.dstack(planes).astype(np.float32)
     rgb_gains = np.array(
@@ -301,7 +364,7 @@ def process_ov5678_rgbir(
         raise ValueError(f"unknown OV5678 CCM profile: {settings.ccm_profile}")
     rgb = np.maximum(rgb @ ccm.T, 0.0)
     if settings.awb_mode == "grayworld":
-        rgb = _apply_grayworld_awb(rgb, settings.awb_strength)
+        rgb = _apply_grayworld_awb(rgb, settings.awb_strength, awb_state=norm_state, awb_ema=settings.awb_ema)
     elif settings.awb_mode != "fixed":
         raise ValueError(f"unknown OV5678 AWB mode: {settings.awb_mode}")
     saturation = (

@@ -5,7 +5,7 @@ After=systemd-modules-load.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/sbin/modprobe v4l2loopback devices=2 video_nr=42,43 card_label="Processed GC5035,Processed OV5678" exclusive_caps=0,0 max_buffers=4
+ExecStart=/usr/sbin/modprobe v4l2loopback devices=2 video_nr=42,43 card_label="Processed GC5035,Processed OV5678" exclusive_caps=1,1 max_buffers=2
 ExecStop=/usr/sbin/modprobe -r v4l2loopback
 
 [Install]
